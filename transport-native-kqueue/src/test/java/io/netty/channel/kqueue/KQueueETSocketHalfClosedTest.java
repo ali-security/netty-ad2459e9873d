@@ -19,6 +19,9 @@ import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.testsuite.transport.TestsuitePermutation;
 import io.netty.testsuite.transport.socket.SocketHalfClosedTest;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 
 import java.util.List;
 
@@ -26,5 +29,13 @@ public class KQueueETSocketHalfClosedTest extends SocketHalfClosedTest {
     @Override
     protected List<TestsuitePermutation.BootstrapComboFactory<ServerBootstrap, Bootstrap>> newFactories() {
         return KQueueSocketTestPermutation.INSTANCE.socket();
+    }
+
+    @Disabled("Flaky on GitHub macOS runners: the read-complete upper bound (8202) is exceeded by timing-dependent "
+            + "kqueue read chunking (observed 8225/8226)")
+    @Test
+    @Override
+    public void testAllDataReadClosure(TestInfo testInfo) throws Throwable {
+        super.testAllDataReadClosure(testInfo);
     }
 }

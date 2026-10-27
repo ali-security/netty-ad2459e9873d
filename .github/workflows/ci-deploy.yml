@@ -16,71 +16,26 @@
 name: Deploy project
 
 on:
-  push:
-    branches: [ "4.1" ]
-
-  schedule:
-    - cron: '30 1 * * 1'  # At 01:30 on Monday, every Monday.
-
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
-  
+    inputs:
+      test-filter:
+        description: 'Optional surefire -Dtest selector'
+        required: false
+        default: ''
+
 permissions: read-all
 
 env:
   MAVEN_OPTS: -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.http.retryhandler.count=5 -Dmaven.wagon.httpconnectionManager.ttlSeconds=240
 
 jobs:
-  stage-snapshot:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - setup: linux-x86_64-java8
-            docker-compose-build: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-6.18.yaml build"
-            docker-compose-run: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-6.18.yaml run stage-snapshot"
-          - setup: linux-aarch64
-            docker-compose-build: "-f docker/docker-compose.centos-7.yaml build"
-            docker-compose-run: "-f docker/docker-compose.centos-7.yaml run cross-compile-aarch64-stage-snapshot"
-          - setup: linux-riscv64
-            docker-compose-build: "-f docker/docker-compose.ubuntu-20.04.yaml build"
-            docker-compose-run: "-f docker/docker-compose.ubuntu-20.04.yaml run cross-compile-riscv64-stage-snapshot"
-
-    name: stage-snapshot-${{ matrix.setup }}
-    steps:
-      - uses: actions/checkout@v4
-
-      # Cache .m2/repository
-      - name: Cache local Maven repository
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ matrix.setup }}-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-${{ matrix.setup }}-
-            ${{ runner.os }}-maven-
-
-      - name: Create local staging directory
-        run: mkdir -p ~/local-staging
-
-      - name: Build docker image
-        run: docker-compose ${{ matrix.docker-compose-build }}
-
-      - name: Stage snapshots to local staging directory
-        run: docker-compose ${{ matrix.docker-compose-run }}
-
-      - name: Upload local staging directory
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.setup }}-local-staging
-          path: ~/local-staging
-          if-no-files-found: error
-
-  deploy-staged-snapshots:
-    runs-on: ubuntu-latest
-    # Wait until we have staged everything
-    needs: stage-snapshot
+  # netty-transport-native-kqueue ships osx-aarch_64 / osx-x86_64 classifier jars only; on 4.1 they are
+  # built on macOS, so stage them on macOS runners: aarch64 (plus the main and tests jars) here, x86_64 natively below.
+  stage-snapshot-macos:
+    runs-on: macos-14
+    timeout-minutes: 45
+    name: stage-snapshot-macos-kqueue
     steps:
       - uses: actions/checkout@v4
 
@@ -93,57 +48,202 @@ jobs:
       # Cache .m2/repository
       - name: Cache local Maven repository
         uses: actions/cache@v4
-        continue-on-error: true
         with:
           path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-deploy-staged-snapshots-${{ hashFiles('**/pom.xml') }}
+          key: ${{ runner.os }}-maven-stage-snapshot-macos-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
-            ${{ runner.os }}-maven-deploy-staged-snapshots-
+            ${{ runner.os }}-maven-stage-snapshot-macos-
             ${{ runner.os }}-maven-
 
-      # Setup some env to re-use later.
-      - name: Prepare environment variables
+      - name: Install native build tools
+        run: brew install autoconf automake libtool
+
+      - name: Install kqueue dependencies
+        run: ./mvnw -B -ntp -pl transport-native-kqueue -am clean install -DskipTests=true
+
+      # The kqueue test suite runs in the test-macos job below (sharded so it fits the CI time budget).
+      - name: Build kqueue (osx-aarch_64)
+        run: ./mvnw -B -ntp -pl transport-native-unix-common,transport-native-kqueue clean package -DskipTests=true
+
+      - name: Collect osx-aarch_64, main and tests jars
         run: |
-          echo "LOCAL_STAGING_DIR=$HOME/local-staging" >> $GITHUB_ENV
+          mkdir -p ~/kqueue-staging
+          cp transport-native-kqueue/target/netty-transport-native-kqueue-*-osx-aarch_64.jar ~/kqueue-staging/
+          cp transport-native-kqueue/target/netty-transport-native-kqueue-*-tests.jar ~/kqueue-staging/
+          cp transport-native-kqueue/target/netty-transport-native-kqueue-*.Final.jar ~/kqueue-staging/
+          ls -l ~/kqueue-staging
 
-      # Hardcode the staging artifacts that need to be downloaded.
-      # These must match the matrix setups. There is currently no way to pull this out of the config.
-      - name: Download linux-aarch64 staging directory
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-aarch64-local-staging
-          path: ~/linux-aarch64-local-staging
-
-      - name: Download linux-riscv64 staging directory
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-riscv64-local-staging
-          path: ~/linux-riscv64-local-staging
-
-      - name: Download linux-x86_64-java8 staging directory
-        uses: actions/download-artifact@v4
-        with:
-          name: linux-x86_64-java8-local-staging
-          path: ~/linux-x86_64-java8-local-staging
-
-      - name: Merge staging repositories
+      - name: Check osx-aarch_64 jnilib links libnetty-unix-common
         run: |
-          mkdir -p ~/local-staging/deferred
-          cat ~/linux-aarch64-local-staging/deferred/.index >>  ~/local-staging/deferred/.index
-          cp -r ~/linux-aarch64-local-staging/deferred/* ~/local-staging/deferred/
-          cat ~/linux-riscv64-local-staging/deferred/.index >>  ~/local-staging/deferred/.index
-          cp -r ~/linux-riscv64-local-staging/deferred/* ~/local-staging/deferred/
-          cat ~/linux-x86_64-java8-local-staging/deferred/.index >>  ~/local-staging/deferred/.index
-          cp -r ~/linux-x86_64-java8-local-staging/deferred/* ~/local-staging/deferred/
+          set -e
+          lib=transport-native-kqueue/target/native-build/target/lib/libnetty_transport_native_kqueue_aarch_64.jnilib
+          [ -f "$lib" ] || lib=$(find transport-native-kqueue/target -name 'libnetty_transport_native_kqueue_aarch_64.jnilib' | head -1)
+          file "$lib"
+          otool -hv "$lib"
+          echo "netty_unix_* symbols:"; nm -m "$lib" | awk '/_netty_unix_(register|socket_recvFd)/'
+          if nm -u "$lib" | grep -q '_netty_unix_'; then echo "ERROR: unresolved netty_unix_* symbols"; nm -u "$lib" | grep '_netty_unix_'; exit 1; fi
+          nm "$lib" | grep -q ' _netty_unix_socket_recvFd$' || { echo "ERROR: _netty_unix_socket_recvFd not defined"; exit 1; }
 
-      - uses: s4u/maven-settings-action@v3.0.0
+      - name: Upload kqueue jars
+        uses: actions/upload-artifact@v4
         with:
-          servers: |
-            [{
-              "id": "sonatype-nexus-snapshots",
-              "username": "${{ secrets.SONATYPE_USERNAME }}",
-              "password": "${{ secrets.SONATYPE_PASSWORD }}"
-            }]
+          name: macos-kqueue-local-staging
+          path: ~/kqueue-staging/*.jar
+          if-no-files-found: error
 
-      - name: Deploy local staged artifacts
-        run: ./mvnw -B --file pom.xml org.sonatype.plugins:nexus-staging-maven-plugin:deploy-staged -DaltStagingDirectory=$LOCAL_STAGING_DIR
+  # The osx-x86_64 jar is built natively on the Intel macOS runner. The unix-common pom's mac-intel-cross-compile
+  # profile hard-codes "-target arm64-apple-macos11", so cross-compiling from arm64 links an arm64 libnetty-unix-common.a
+  # into the x86_64 jnilib (silently dropped by -weak_library), leaving every netty_unix_* symbol unresolved.
+  stage-snapshot-macos-x86_64:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    name: stage-snapshot-macos-kqueue-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '8'
+          architecture: 'x64'
+
+      # Cache .m2/repository
+      - name: Cache local Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-x64-maven-stage-snapshot-macos-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-x64-maven-stage-snapshot-macos-
+
+      - name: Install native build tools
+        run: brew install autoconf automake libtool
+
+      - name: Install kqueue dependencies
+        run: ./mvnw -B -ntp -pl transport-native-kqueue -am clean install -DskipTests=true
+
+      - name: Build kqueue (osx-x86_64)
+        run: ./mvnw -B -ntp -pl transport-native-unix-common,transport-native-kqueue clean package -DskipTests=true
+
+      - name: Check osx-x86_64 jnilib links libnetty-unix-common
+        run: |
+          set -e
+          lib=$(find transport-native-kqueue/target -name 'libnetty_transport_native_kqueue_x86_64.jnilib' | head -1)
+          file "$lib"
+          otool -hv "$lib"
+          echo "netty_unix_* symbols:"; nm -m "$lib" | awk '/_netty_unix_(register|socket_recvFd)/'
+          if nm -u "$lib" | grep -q '_netty_unix_'; then echo "ERROR: unresolved netty_unix_* symbols"; nm -u "$lib" | grep '_netty_unix_'; exit 1; fi
+          nm "$lib" | grep -q ' _netty_unix_socket_recvFd$' || { echo "ERROR: _netty_unix_socket_recvFd not defined"; exit 1; }
+
+      - name: Collect osx-x86_64 jar
+        run: |
+          mkdir -p ~/kqueue-staging-x86_64
+          cp transport-native-kqueue/target/netty-transport-native-kqueue-*-osx-x86_64.jar ~/kqueue-staging-x86_64/
+          ls -l ~/kqueue-staging-x86_64
+
+      - name: Upload kqueue osx-x86_64 jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-x86_64-kqueue-local-staging
+          path: ~/kqueue-staging-x86_64/*-osx-x86_64.jar
+          if-no-files-found: error
+
+  test-macos:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each *SocketSslEchoTest class takes ~13 minutes on a macOS runner, so each gets its own shard.
+          - shard: ssl-echo
+            runner: macos-14
+            mvn-extra: ""
+            tests: "KQueueSocketSslEchoTest"
+          - shard: jdk-loopback-ssl-echo
+            runner: macos-14
+            mvn-extra: ""
+            tests: "KQueueJdkLoopbackSocketSslEchoTest"
+          - shard: rcv-allocator-ssl-echo
+            runner: macos-14
+            mvn-extra: ""
+            tests: "KQueueRcvAllocatorOverrideSocketSslEchoTest"
+          - shard: rest
+            runner: macos-14
+            mvn-extra: ""
+            tests: "K*Test,!KQueueSocketSslEchoTest,!KQueueJdkLoopbackSocketSslEchoTest,!KQueueRcvAllocatorOverrideSocketSslEchoTest"
+          # Exercise the natively built x86_64 jnilib (shipped in the osx-x86_64 jar) on the Intel runner through the
+          # unix-domain-socket suites (sendFd/recvFd live in transport-native-unix-common's netty_unix_socket.c).
+          # The TCP/UDP testsuite classes are not repeated here: on the macos-15-intel image they hang on un-timed
+          # latches (KQueueDatagramUnicastIPv6MappedTest, SocketChannelNotYetConnectedTest); they run on arm64 above.
+          # -Pboringssl selects the static tcnative that macOS aarch64 auto-selects, so SSL tests behave the same.
+          - shard: domain-socket-x86_64
+            runner: macos-15-intel
+            mvn-extra: "-Pboringssl"
+            tests: "KQueueDomainSocket*Test,KQueueDomainDatagramPathTest,KQueueEventLoopTest"
+    name: test-macos-kqueue-${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '8'
+
+      # Cache .m2/repository
+      - name: Cache local Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-${{ runner.arch }}-maven-test-macos-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-maven-test-macos-
+
+      - name: Install native build tools
+        run: brew install autoconf automake libtool
+
+      - name: Install kqueue dependencies
+        run: ./mvnw -B -ntp ${{ matrix.mvn-extra }} -pl transport-native-kqueue -am clean install -DskipTests=true
+
+      - name: Test kqueue
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw -B -ntp ${{ matrix.mvn-extra }} -pl transport-native-unix-common,transport-native-kqueue clean package -Dio.netty.testsuite.badHost=netty.io -Dtest='${{ inputs.test-filter }}' -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            ./mvnw -B -ntp ${{ matrix.mvn-extra }} -pl transport-native-unix-common,transport-native-kqueue clean package -Dio.netty.testsuite.badHost=netty.io -Dtest='${{ matrix.tests }}' -Dsurefire.failIfNoSpecifiedTests=false
+          fi
+
+      - name: Print skipped tests with reasons
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import collections, glob, xml.etree.ElementTree as ET
+          tot = collections.Counter()
+          skips = collections.OrderedDict()
+          for f in sorted(glob.glob('transport-native-*/target/surefire-reports/TEST-*.xml')):
+              r = ET.parse(f).getroot()
+              for k in ('tests', 'failures', 'errors', 'skipped'):
+                  tot[k] += int(r.get(k, 0))
+              for tc in r.iter('testcase'):
+                  s = tc.find('skipped')
+                  if s is not None:
+                      msg = ' '.join((s.get('message') or 'no message').split())[:160]
+                      key = (tc.get('classname'), tc.get('name').split('{')[0], msg)
+                      skips[key] = skips.get(key, 0) + 1
+          for (c, n, m), cnt in skips.items():
+              print('SKIPPED x%d: %s.%s -- reason: %s' % (cnt, c, n, m))
+          print('SUREFIRE TOTAL: run=%d failures=%d errors=%d skipped=%d passed=%d' % (
+              tot['tests'], tot['failures'], tot['errors'], tot['skipped'],
+              tot['tests'] - tot['failures'] - tot['errors'] - tot['skipped']))
+          EOF
+          echo "Source guards behind the skips above:"
+          echo "- testSslRenegotiationRejected: renegotiation is unsupported by BoringSSL (netty-tcnative-boringssl-static, auto-selected on macOS aarch64):"
+          grep -n "assumeFalse(\"BoringSSL\"\|assumeTrue(OpenSsl.isAvailable" testsuite/src/main/java/io/netty/testsuite/transport/socket/SocketSslClientRenegotiateTest.java
+          echo "- testAcceptFilter: SO_ACCEPTFILTER is a FreeBSD feature, unsupported on macOS:"
+          grep -n "PLATFORM_UNSUPPORTED" transport-native-kqueue/src/test/java/io/netty/channel/kqueue/KQueueServerSocketChannelConfigTest.java
+          echo "- testReceiveEmptyDatagrams (domain datagram): JDK DatagramSocket cannot bind a unix-domain address, test assumes it away:"
+          grep -n "unsupported address type" testsuite/src/main/java/io/netty/testsuite/transport/socket/DatagramUnicastTest.java
+          echo "- testWriteAfterShutdownOutputNoWritabilityChange: disabled upstream with a bare @Disabled annotation:"
+          grep -n -A3 "@Disabled" testsuite/src/main/java/io/netty/testsuite/transport/socket/SocketShutdownOutputBySelfTest.java
