@@ -44,6 +44,12 @@
 #define MSG_FASTOPEN 0x20000000
 #endif
 
+// Number of fds recvFd(...) can see (and so close) when a peer sends more than the single fd we expect in one
+// SCM_RIGHTS message. The kernel installs every passed fd before copying the ancillary data out, and some kernels
+// (e.g. XNU) do not close the fds that did not fit into the control buffer (MSG_CTRUNC), so the buffer must be big
+// enough for the largest SCM_RIGHTS message the kernel accepts (bounded by MCLBYTES on BSD, SCM_MAX_FD on Linux).
+#define NETTY_UNIX_RECV_FD_MAX 512
+
 static jweak datagramSocketAddressClassWeak = NULL;
 static jweak domainDatagramSocketAddressClassWeak = NULL;
 static jmethodID datagramSocketAddrMethodId = NULL;
@@ -923,13 +929,9 @@ static jint netty_unix_socket_recvFd(JNIEnv* env, jclass clazz, jint fd) {
     int socketFd;
     struct msghdr descriptorMessage = { 0 };
     struct iovec iov[1] = { { 0 } };
-    char control[CMSG_SPACE(sizeof(int))] = { 0 };
+    char control[CMSG_SPACE(sizeof(int) * NETTY_UNIX_RECV_FD_MAX)] = { 0 };
     char iovecData[1];
 
-    descriptorMessage.msg_control = control;
-    descriptorMessage.msg_controllen = sizeof(control);
-    descriptorMessage.msg_iov = iov;
-    descriptorMessage.msg_iovlen = 1;
     iov[0].iov_base = iovecData;
     iov[0].iov_len = sizeof(iovecData);
 
@@ -937,6 +939,14 @@ static jint netty_unix_socket_recvFd(JNIEnv* env, jclass clazz, jint fd) {
     int err;
 
     for (;;) {
+        // Reset descriptorMessage to an initial start at the beginning of the loop as we might run it multiple
+        // times.
+        memset(&descriptorMessage, 0, sizeof(descriptorMessage));
+        descriptorMessage.msg_control = control;
+        descriptorMessage.msg_controllen = sizeof(control);
+        descriptorMessage.msg_iov = iov;
+        descriptorMessage.msg_iovlen = 1;
+
         do {
             res = recvmsg(fd, &descriptorMessage, 0);
             // Keep on reading if we was interrupted
@@ -950,21 +960,67 @@ static jint netty_unix_socket_recvFd(JNIEnv* env, jclass clazz, jint fd) {
             return -err;
         }
 
-        struct cmsghdr* cmsg = CMSG_FIRSTHDR(&descriptorMessage);
-        if (!cmsg) {
-            return -errno;
+        // Walk every cmsg; close any SCM_RIGHTS fds we cannot use so they
+        // are never silently leaked (e.g. peer sent more than one fd).
+        jint result = -1;
+        err = 0;
+
+        // If ancillary data was truncated the kernel auto-closes fds that
+        // did not fit (Linux only, XNU does not, see NETTY_UNIX_RECV_FD_MAX) but it is still an error we must not
+        // retry and so should report it back to the caller.
+        // Beside this we also need to ensure we close all other fds so they not leak.
+        if (descriptorMessage.msg_flags & MSG_CTRUNC) {
+            err = EMSGSIZE;
         }
 
-        if ((cmsg->cmsg_len == CMSG_LEN(sizeof(int))) && (cmsg->cmsg_level == SOL_SOCKET) && (cmsg->cmsg_type == SCM_RIGHTS)) {
-            socketFd = *((int *) CMSG_DATA(cmsg));
-            // set as non blocking as we want to use it with kqueue/epoll
-            if (fcntl(socketFd, F_SETFL, O_NONBLOCK) == -1) {
-                err = errno;
-                close(socketFd);
-                return -err;
+        struct cmsghdr* cmsg = CMSG_FIRSTHDR(&descriptorMessage);
+        while (cmsg != NULL) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+                int* fds  = (int*) CMSG_DATA(cmsg);
+                char* controlEnd = (char*) descriptorMessage.msg_control + descriptorMessage.msg_controllen;
+                size_t claimedFds = cmsg->cmsg_len > CMSG_LEN(0) ? (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int) : 0;
+                // Some kernels (e.g. XNU) do not shrink cmsg_len when the ancillary data was truncated (MSG_CTRUNC),
+                // so never read more fds than were actually copied into our control buffer.
+                size_t copiedFds = controlEnd > (char*) fds ? (size_t) (controlEnd - (char*) fds) / sizeof(int) : 0;
+                int nfds = (int) (claimedFds < copiedFds ? claimedFds : copiedFds);
+
+                if (nfds == 1 && err == 0) {
+                    socketFd = fds[0];
+
+                    // set as non blocking as we want to use it with kqueue/epoll
+                    if (fcntl(socketFd, F_SETFL, O_NONBLOCK) == -1) {
+                        err = errno;
+                        close(socketFd);
+                    } else {
+                        result = socketFd;
+                    }
+                } else {
+                    int i = 0;
+                    // Peer sent an unexpected number of fds; close them all
+                    // and signal an error so the caller does not retry blindly.
+                    for (i = 0; i < nfds; i++) {
+                        close(fds[i]);
+                    }
+                    if (result >= 0) {
+                        // Already accepted one fd above; undo it.
+                        close(result);
+                        result = -1;
+                    }
+                    // check if we need to update the err or if we already did set it to an error.
+                    if (err == 0) {
+                        err = EINVAL;
+                    }
+                }
             }
-            return socketFd;
+            cmsg = CMSG_NXTHDR(&descriptorMessage, cmsg);
         }
+        if (result != -1) {
+            return result;
+        }
+        if (err != 0) {
+            return -err;
+        }
+        // No SCM_RIGHTS cmsg found and no error; try again.
     }
 }
 
